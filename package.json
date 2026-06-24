@@ -1,0 +1,17 @@
+{
+  "name": "lympha-backend",
+  "version": "1.0.0",
+  "description": "Lympha Evidence Engine — backend планировщик и API (Europe PMC)",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "collect": "node src/jobs/collect.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "node-cron": "^3.0.3"
+  },
+  "engines": { "node": ">=18" }
+}
