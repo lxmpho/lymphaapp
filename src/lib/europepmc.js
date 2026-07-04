@@ -2,19 +2,13 @@
 // Документация синтаксиса запросов: https://europepmc.org/RestfulWebService
 //
 // ВАЖНО про среду: публичный хост ebi.ac.uk доступен с обычного сервера,
-// но НЕ из этой песочницы (ограниченный список доменов). Поэтому модуль
-// написан так, чтобы при недоступности сети аккуратно бросать ошибку,
-// которую планировщик логирует и пропускает цикл. На реальном сервере
-// сетевые вызовы проходят без изменений в коде.
+// но НЕ из этой песочницы (ограниченный список доменов). Логика маршрутизации
+// идентификаторов тестируется отдельно (test/identifier.test.js), сетевые
+// вызовы проходят без изменений на реальном сервере.
 
 const BASE = 'https://www.ebi.ac.uk/europepmc/webservices/rest';
 
 // --- Сборка поискового запроса для специальности (раздел 4 ТЗ) ---
-//
-// Пример итогового query:
-//   ("dental implant" OR "osseointegration" OR "peri-implantitis")
-//   AND (PUB_TYPE:"Randomized Controlled Trial" OR PUB_TYPE:"Systematic Review" OR PUB_TYPE:"Meta-Analysis")
-//   AND (FIRST_PDATE:[2026-05-16 TO 2026-06-15])
 export function buildSpecialtyQuery({ terms, pubTypes, dateFrom, dateTo }) {
   const termBlock = '(' + terms.map((t) => `"${t}"`).join(' OR ') + ')';
   const typeBlock = '(' + pubTypes.map((t) => `PUB_TYPE:"${t}"`).join(' OR ') + ')';
@@ -23,39 +17,72 @@ export function buildSpecialtyQuery({ terms, pubTypes, dateFrom, dateTo }) {
 }
 
 // --- Поиск статей (esearch-эквивалент) ---
-// Возвращает массив "сырых" результатов Europe PMC (resultType=core).
 export async function searchArticles({ query, pageSize = 25, sort = 'CITED desc' }) {
   const url =
     `${BASE}/search` +
     `?query=${encodeURIComponent(query)}` +
     `&sort=${encodeURIComponent(sort)}` +
     `&resultType=core&pageSize=${pageSize}&format=json`;
-
   const data = await fetchJsonWithRetry(url);
   return data?.resultList?.result ?? [];
 }
 
-// --- Получение одной статьи по PMID (для прокси-эндпоинта) ---
-// Повторяет запрос, который прототип уже делает на клиенте (раздел 1 ТЗ).
-export async function getArticleByPmid(pmid) {
-  const query = `EXT_ID:${pmid} AND SRC:MED`;
+// ─────────────────────────────────────────────────────────────
+// PATH B: раздельная работа с идентификаторами PMID и PMCID.
+//
+// Проблема, которую это решает: у части статей в Europe PMC нет обычного
+// числового PMID — есть только PMCID (вида "PMC13290632"). Раньше такой
+// идентификатор попадал в поле pmid и ломал и поиск статьи, и полный текст,
+// потому что искали его как PMID по базе MEDLINE (SRC:MED), где его нет.
+//
+// Теперь идентификатор классифицируется, и для каждого типа строится
+// правильный запрос. Функция чистая — её легко протестировать без сети.
+// ─────────────────────────────────────────────────────────────
+
+// Классификация идентификатора: 'pmcid' | 'pmid'.
+export function classifyIdentifier(id) {
+  return /^PMC\d+$/i.test(String(id)) ? 'pmcid' : 'pmid';
+}
+
+// Построить поисковый query Europe PMC под тип идентификатора.
+//   PMCID → ищем по полю PMCID
+//   PMID  → ищем по внешнему ID в MEDLINE
+export function buildLookupQuery(id) {
+  if (classifyIdentifier(id) === 'pmcid') {
+    const pmc = String(id).toUpperCase();
+    return `PMCID:${pmc}`;
+  }
+  return `EXT_ID:${id} AND SRC:MED`;
+}
+
+// --- Получение одной статьи по идентификатору (PMID или PMCID) ---
+export async function getArticle(identifier) {
+  const query = buildLookupQuery(identifier);
   const url =
     `${BASE}/search` +
     `?query=${encodeURIComponent(query)}` +
     `&resultType=core&format=json`;
-
   const data = await fetchJsonWithRetry(url);
   const rec = data?.resultList?.result?.[0];
   if (!rec) return null;
   return normalizeArticle(rec);
 }
 
+// Обратная совместимость: старое имя, если где-то ещё вызывается.
+export const getArticleByPmid = getArticle;
+
 // --- Нормализация записи Europe PMC → плоский объект для клиента ---
 export function normalizeArticle(rec) {
   const isOA = rec.isOpenAccess === 'Y';
-  const pmcid = rec.pmcid || null; // нужен для загрузки полного текста OA
+  // PATH B: pmid и pmcid хранятся РАЗДЕЛЬНО. pmid — только настоящий числовой
+  // PMID (без подстановки id/PMCID). pmcid — отдельное поле для полного текста.
+  const pmid = rec.pmid || null;
+  const pmcid = rec.pmcid || null;
+  // Стабильный идентификатор для клиента: предпочитаем PMID, иначе PMCID.
+  const id = pmid || pmcid || rec.id || null;
   return {
-    pmid: rec.pmid || rec.id || null,
+    id,
+    pmid,
     pmcid,
     title: rec.title || '',
     authors: rec.authorString || '',
@@ -73,22 +100,18 @@ export function normalizeArticle(rec) {
 }
 
 // --- Загрузка полного текста Open Access статьи по PMCID ---
-// Europe PMC отдаёт JATS XML по адресу /{PMCID}/fullTextXML.
-// Возвращает массив секций { heading, text } или null, если текст недоступен.
 export async function getFullText(pmcid) {
   if (!pmcid) return null;
   const id = String(pmcid).toUpperCase().startsWith('PMC') ? pmcid : `PMC${pmcid}`;
   const url = `${BASE}/${id}/fullTextXML`;
-
   const xml = await fetchTextWithRetry(url);
   if (!xml) return null;
-
   const { jatsToSections } = await import('./fulltext.js');
   const sections = jatsToSections(xml);
   return sections.length ? sections : null;
 }
 
-// --- fetch с одним повтором при сбое (раздел 1: "при сбое — один повтор") ---
+// --- fetch JSON с одним повтором ---
 async function fetchJsonWithRetry(url, attempt = 0) {
   try {
     const res = await fetch(url, {
@@ -105,15 +128,13 @@ async function fetchJsonWithRetry(url, attempt = 0) {
   }
 }
 
-// --- Загрузка текстового ответа (XML полного текста) с одним повтором ---
-// Полный текст может отсутствовать (404) даже у OA-статьи — это не ошибка,
-// просто возвращаем null, чтобы клиент показал аннотацию.
+// --- fetch текста (XML полного текста) с одним повтором ---
 async function fetchTextWithRetry(url, attempt = 0) {
   try {
     const res = await fetch(url, {
       headers: { Accept: 'application/xml', 'User-Agent': 'Lympha-EvidenceEngine/1.0' },
     });
-    if (res.status === 404) return null; // полного текста нет — это нормально
+    if (res.status === 404) return null;
     if (!res.ok) throw new Error(`Europe PMC fullText HTTP ${res.status}`);
     return await res.text();
   } catch (err) {
@@ -121,6 +142,6 @@ async function fetchTextWithRetry(url, attempt = 0) {
       await new Promise((r) => setTimeout(r, 800));
       return fetchTextWithRetry(url, attempt + 1);
     }
-    return null; // при стойком сбое не валим запрос — отдаём null
+    return null;
   }
 }
