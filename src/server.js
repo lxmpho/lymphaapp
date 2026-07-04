@@ -57,7 +57,7 @@ app.get('/api/digest', async (req, res) => {
 // --- Статья по PMID (прокси, содержимое в реальном времени) ---
 app.get('/api/article/:pmid', async (req, res) => {
   const { pmid } = req.params;
-  if (!/^\d+$/.test(pmid)) return res.status(400).json({ error: 'Некорректный PMID' });
+  if (!/^(PMC)?\d+$/i.test(pmid)) return res.status(400).json({ error: 'Некорректный PMID' });
 
   try {
     const article = await getArticleByPmid(pmid);
@@ -73,7 +73,7 @@ app.get('/api/article/:pmid', async (req, res) => {
 // отдаёт fullText: null — клиент показывает аннотацию.
 app.get('/api/article/:pmid/fulltext', async (req, res) => {
   const { pmid } = req.params;
-  if (!/^\d+$/.test(pmid)) return res.status(400).json({ error: 'Некорректный PMID' });
+  if (!/^(PMC)?\d+$/i.test(pmid)) return res.status(400).json({ error: 'Некорректный PMID' });
 
   try {
     const article = await getArticleByPmid(pmid);
