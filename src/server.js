@@ -1,38 +1,56 @@
 // Lympha Evidence Engine — HTTP API + планировщик.
 //
 // Эндпоинты:
-//   GET /api/feed                — лента готовых статей (?specialty=)
-//   GET /api/digest              — дайджест недели (топ-3 на специальность)
-//   GET /api/article/:id         — содержимое статьи (PMID или PMCID)
-//   GET /api/article/:id/fulltext— полный текст OA-статьи (секции)
-//   GET /api/guidelines          — клинические руководства (?specialty=)
-//   GET /api/health              — статус и время последней сборки
-//
-// Планировщик: node-cron, ежесуточно ночью (04:00) запускает runCollection.
+//   POST /api/ask                — клинический вопрос → доказательный ответ (Claude + проверка цитат)
+//   GET  /api/feed               — лента готовых статей (?specialty=)
+//   GET  /api/digest             — дайджест недели (топ-3 на специальность)
+//   GET  /api/article/:id        — содержимое статьи (PMID или PMCID)
+//   GET  /api/article/:id/fulltext — полный текст OA-статьи (секции)
+//   GET  /api/guidelines         — клинические руководства (?specialty=)
+//   GET  /api/health             — статус и время последней сборки
 
 import express from 'express';
 import cron from 'node-cron';
 import { getLatest } from './lib/storage.js';
 import { getArticle, getFullText } from './lib/europepmc.js';
 import { getGuidelinesFor } from './data/guidelines.js';
+import { askLympha } from './lib/ask.js';
 import { runCollection } from './jobs/collect.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// PATH B: идентификатор статьи — это PMID (цифры) ИЛИ PMCID (PMC + цифры).
 const ID_RE = /^(PMC)?\d+$/i;
 
-// CORS — Telegram Mini App грузится с другого домена.
+app.use(express.json({ limit: '32kb' }));
+
 app.use((req, res, next) => {
   res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.set('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// --- Лента ---
+// --- Клинический вопрос Лимфе ---
+// Ключ Claude живёт ТОЛЬКО здесь (ANTHROPIC_API_KEY), не во фронтенде.
+// Каждый PMID в ответе сверяется с Europe PMC (см. lib/ask.js).
+app.post('/api/ask', async (req, res) => {
+  const question = req.body && req.body.question;
+  if (!question || !String(question).trim()) {
+    return res.status(400).json({ error: 'Пустой вопрос' });
+  }
+  try {
+    const result = await askLympha(String(question));
+    if (result.error) {
+      const code = result.error === 'no_api_key' ? 503 : 502;
+      return res.status(code).json(result);
+    }
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: 'internal', detail: err.message });
+  }
+});
+
 app.get('/api/feed', async (req, res) => {
   const snap = await getLatest();
   if (!snap) return res.status(503).json({ error: 'Подборки ещё не сформированы. Запустите сбор.' });
@@ -42,18 +60,14 @@ app.get('/api/feed', async (req, res) => {
   res.json({ feed, generatedAt: snap.generatedAt, window: snap.window });
 });
 
-// --- Дайджест ---
 app.get('/api/digest', async (req, res) => {
   const snap = await getLatest();
   if (!snap) return res.status(503).json({ error: 'Подборки ещё не сформированы. Запустите сбор.' });
   const { specialty } = req.query;
-  const digest = specialty
-    ? { [specialty]: snap.digest?.[specialty] || [] }
-    : snap.digest || {};
+  const digest = specialty ? { [specialty]: snap.digest?.[specialty] || [] } : snap.digest || {};
   res.json({ digest, generatedAt: snap.generatedAt });
 });
 
-// --- Статья по идентификатору (PMID или PMCID) ---
 app.get('/api/article/:id', async (req, res) => {
   const { id } = req.params;
   if (!ID_RE.test(id)) return res.status(400).json({ error: 'Некорректный идентификатор' });
@@ -66,44 +80,29 @@ app.get('/api/article/:id', async (req, res) => {
   }
 });
 
-// --- Полный текст Open Access статьи ---
-// PATH B: принимаем PMID или PMCID; полный текст тянем по pmcid найденной статьи.
 app.get('/api/article/:id/fulltext', async (req, res) => {
   const { id } = req.params;
   if (!ID_RE.test(id)) return res.status(400).json({ error: 'Некорректный идентификатор' });
   try {
     const article = await getArticle(id);
     if (!article) return res.status(404).json({ error: 'Статья не найдена' });
-
     if (!article.fullTextAvailable || !article.pmcid) {
-      return res.json({
-        id,
-        fullText: null,
-        reason: 'not_open_access',
-        message: 'Полный текст доступен только для статей открытого доступа.',
-      });
+      return res.json({ id, fullText: null, reason: 'not_open_access',
+        message: 'Полный текст доступен только для статей открытого доступа.' });
     }
-
     const sections = await getFullText(article.pmcid);
-    res.json({
-      id,
-      pmcid: article.pmcid,
-      fullText: sections,
-      reason: sections ? null : 'not_retrievable',
-    });
+    res.json({ id, pmcid: article.pmcid, fullText: sections, reason: sections ? null : 'not_retrievable' });
   } catch (err) {
     res.status(502).json({ error: 'Источник недоступен', detail: err.message });
   }
 });
 
-// --- Клинические руководства ---
 app.get('/api/guidelines', (req, res) => {
   const { specialty } = req.query;
   const guidelines = getGuidelinesFor(specialty || null);
   res.json({ guidelines, count: guidelines.length });
 });
 
-// --- Здоровье сервиса ---
 app.get('/api/health', async (req, res) => {
   const snap = await getLatest();
   res.json({
@@ -111,10 +110,10 @@ app.get('/api/health', async (req, res) => {
     lastCollection: snap?.generatedAt || null,
     feedSize: snap?.feed?.length || 0,
     specialties: snap?.digest ? Object.keys(snap.digest).length : 0,
+    aiConfigured: Boolean(process.env.ANTHROPIC_API_KEY),
   });
 });
 
-// --- Ручной триггер сбора ---
 app.get('/api/admin/collect', async (req, res) => {
   const token = process.env.ADMIN_TOKEN;
   if (token && req.query.token !== token) return res.status(403).json({ error: 'forbidden' });
@@ -126,14 +125,11 @@ app.get('/api/admin/collect', async (req, res) => {
   }
 });
 
-// --- Планировщик: каждый день в 04:00 ---
 cron.schedule('0 4 * * *', () => {
   console.log('[cron] запуск ночной сборки…');
   runCollection().catch((e) => console.error('[cron] сбой сборки:', e.message));
 });
 
-// PATH B бонус: автосбор при старте, если снимок пуст (лечит обнуление ленты
-// после редеплоя на бесплатном Render с эфемерным диском).
 app.listen(PORT, async () => {
   console.log(`Lympha Evidence Engine слушает порт ${PORT}`);
   console.log(`Планировщик: ежедневно 04:00. Ручной запуск: npm run collect`);
