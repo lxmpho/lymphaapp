@@ -121,7 +121,8 @@ export async function askLympha(question) {
       },
       body: JSON.stringify({
         model: MODEL,
-        max_tokens: 5000,
+        max_tokens: 1500,               // без thinking ответу с цитатами этого хватает
+        thinking: { type: 'disabled' }, // ЭКОНОМИЯ: не платим за невидимые размышления
         system: SYSTEM_PROMPT,
         messages: [{ role: 'user', content: String(question) }],
       }),
