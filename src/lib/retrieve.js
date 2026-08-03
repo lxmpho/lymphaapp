@@ -79,10 +79,27 @@ function escapeTerm(t) {
 /**
  * Запросы строит СЕРВЕР, а не модель.
  *
- * v2: термины ищем в TITLE_ABS (заголовок + абстракт), а не по всему
- * тексту. Это резко повышает релевантность: слово в заголовке/абстракте
- * означает, что статья РЕАЛЬНО об этом, а не просто упомянула вскользь.
+ * v2.1: ищем значимые СЛОВА термина в TITLE_ABS (заголовок + абстракт),
+ * а не точную фразу. Фразовый поиск (ABSTRACT:"antimicrobial prophylaxis")
+ * убивал выдачу — реальные абстракты пишут «prophylactic antimicrobials»,
+ * «antimicrobial regimen» и т.п. Пословный AND в TITLE_ABS даёт нормальный
+ * объём, а фразовую близость всё равно проверяет relevanceScore ПОСЛЕ.
+ * Порядок правильный: ретривал широкий — релевантность фильтром.
  */
+function termToClause(term) {
+  // значимые слова термина (>3 букв), каждое обязано быть в title/abstract
+  const words = String(term)
+    .split(/\s+/)
+    .map((w) => w.replace(/[^\p{L}\p{N}-]/gu, ''))
+    .filter((w) => w.length > 3);
+  if (!words.length) {
+    // короткий термин целиком (напр. "TMD", "bone") — как есть, если непустой
+    const whole = String(term).replace(/[^\p{L}\p{N}-]/gu, '');
+    return whole ? `TITLE_ABS:"${whole}"` : '';
+  }
+  return words.map((w) => `TITLE_ABS:"${w}"`).join(' AND ');
+}
+
 export function buildQueries(terms, opts = {}) {
   const o = { ...DEFAULTS, ...opts };
   const clean = terms.map(escapeTerm).filter(Boolean);
@@ -91,9 +108,10 @@ export function buildQueries(terms, opts = {}) {
   const toYear = new Date().getFullYear();
   const fromYear = toYear - o.yearsBack;
 
-  // каждый термин обязан встретиться в заголовке ИЛИ абстракте
+  // каждый термин -> его значимые слова, всё через AND
   const core = clean
-    .map((t) => `(TITLE:"${t}" OR ABSTRACT:"${t}")`)
+    .map((t) => `(${termToClause(t)})`)
+    .filter((c) => c !== '()')
     .join(' AND ');
 
   const base =
