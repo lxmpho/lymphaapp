@@ -1,7 +1,5 @@
-'use strict';
-
 /**
- * Лимфа — /api/ask v3 (RAG).
+ * Лимфа — /api/ask v3 (RAG, ES module).
  *
  * Отличие от v2: модель больше не вспоминает статьи по памяти и не печатает
  * PMID. Пайплайн:
@@ -14,14 +12,16 @@
  *   4. mapSources()  — сервер подставляет PMID по номеру из своего же массива.
  *
  * Подмена PMID структурно невозможна: модель не имеет доступа к PMID.
+ *
+ * Экспортируется как askLympha — имя, которое импортирует server.js.
  */
 
-const { retrieve, buildContext } = require('./retrieve');
+import { retrieve, buildContext } from './retrieve.js';
 
 const API_URL = 'https://api.anthropic.com/v1/messages';
 const MODEL_PLAN = process.env.LYMPHA_MODEL_PLAN || 'claude-haiku-4-5';
 const MODEL_ANSWER = process.env.LYMPHA_MODEL_ANSWER || 'claude-sonnet-5';
-const MAX_SOURCES = 8; // должно совпадать с retrieve DEFAULTS.maxContext
+export const MAX_SOURCES = 8; // должно совпадать с retrieve DEFAULTS.maxContext
 
 /* ------------------------------------------------------------------ */
 /*  Вызов Claude со structured outputs                                 */
@@ -107,7 +107,7 @@ Rules:
 Example: "Нужна ли антибиотикопрофилактика при дентальной имплантации?"
 -> terms: ["dental implants", "antibiotic prophylaxis"], fallbackTerms: ["dental implants"]`;
 
-async function planSearch(question) {
+export async function planSearch(question) {
   return callClaude({
     model: MODEL_PLAN,
     system: PLAN_SYSTEM,
@@ -170,7 +170,7 @@ Fields:
 - statements: the evidence, broken into individual claims. Each has "text" (one clear sentence in Russian) and "sources" (numbers backing exactly that claim). 3-6 statements.
 - limitations: 1-3 sentences in Russian on what the found evidence does NOT settle (heterogeneity, short follow-up, narrow population, etc.). Be honest.`;
 
-async function answerFromContext(question, articles) {
+export async function answerFromContext(question, articles) {
   const context = buildContext(articles);
   const user = [
     `КЛИНИЧЕСКИЙ ВОПРОС:\n${question}`,
@@ -194,11 +194,11 @@ async function answerFromContext(question, articles) {
 /*  Шаг 4. Сервер подставляет PMID по номеру                           */
 /* ------------------------------------------------------------------ */
 
-function mapSources(parsed, articles) {
+export function mapSources(parsed, articles) {
   const used = new Map(); // index -> [statement texts]
   const statements = [];
 
-  for (const st of parsed.statements || []) {
+  for (const st of (parsed && parsed.statements) || []) {
     const text = String(st.text || '').trim();
     if (!text) continue;
     // отбрасываем номера вне диапазона фактически найденных статей
@@ -246,7 +246,7 @@ function mapSources(parsed, articles) {
 /*  Оркестрация                                                        */
 /* ------------------------------------------------------------------ */
 
-async function ask(question) {
+export async function askLympha(question) {
   const q = String(question || '').trim();
   if (q.length < 5) return { error: 'empty_question' };
   if (q.length > 1000) return { error: 'question_too_long' };
@@ -314,4 +314,5 @@ async function ask(question) {
   };
 }
 
-module.exports = { ask, mapSources, planSearch, answerFromContext, MAX_SOURCES };
+// Совместимость на случай, если где-то в коде ждут имя ask
+export { askLympha as ask };

@@ -1,7 +1,5 @@
-'use strict';
-
 /**
- * Лимфа — retrieval-слой.
+ * Лимфа — retrieval-слой (ES module).
  *
  * Ищет реальные статьи в Europe PMC, классифицирует их по уровню
  * доказательности и собирает пронумерованный контекст для модели.
@@ -12,7 +10,7 @@
 
 const EPMC_SEARCH = 'https://www.ebi.ac.uk/europepmc/webservices/rest/search';
 
-const DEFAULTS = {
+export const DEFAULTS = {
   yearsBack: 12,        // глубина поиска в годах
   perTier: 25,          // сколько тянуть из каждого запроса
   maxContext: 8,        // сколько статей уйдёт в контекст модели
@@ -65,7 +63,7 @@ function escapeTerm(t) {
  * Запросы строит СЕРВЕР, а не модель. Модель даёт только английские
  * термины — синтаксис Europe PMC она путает, а мы нет.
  */
-function buildQueries(terms, opts = {}) {
+export function buildQueries(terms, opts = {}) {
   const o = { ...DEFAULTS, ...opts };
   const clean = terms.map(escapeTerm).filter(Boolean);
   if (!clean.length) return [];
@@ -108,7 +106,7 @@ function buildQueries(terms, opts = {}) {
 /*  Классификация уровня доказательности                               */
 /* ------------------------------------------------------------------ */
 
-function evidenceLevel(art) {
+export function evidenceLevel(art) {
   const types = ((art.pubTypeList && art.pubTypeList.pubType) || [])
     .map((t) => String(t).toLowerCase());
   const title = String(art.title || '').toLowerCase();
@@ -140,7 +138,7 @@ function evidenceLevel(art) {
 /*  Нормализация и ранжирование                                        */
 /* ------------------------------------------------------------------ */
 
-function truncateAbstract(text, limit) {
+export function truncateAbstract(text, limit) {
   const s = String(text || '').replace(/\s+/g, ' ').trim();
   if (s.length <= limit) return s;
   const cut = s.slice(0, limit);
@@ -148,7 +146,7 @@ function truncateAbstract(text, limit) {
   return (lastStop > limit * 0.6 ? cut.slice(0, lastStop + 1) : cut) + ' […]';
 }
 
-function normalize(art, abstractChars) {
+export function normalize(art, abstractChars) {
   const { level, design } = evidenceLevel(art);
   const year = parseInt(String(art.pubYear || ''), 10) || null;
   return {
@@ -174,7 +172,7 @@ function dedupeKey(a) {
   return a.pmid || a.pmcid || a.doi || a.title.toLowerCase();
 }
 
-function score(a) {
+export function score(a) {
   const nowYear = new Date().getFullYear();
   const age = a.year ? nowYear - a.year : 15;
   const recency = Math.max(0, 12 - age) * 1.2;      // свежее — выше
@@ -190,7 +188,7 @@ function score(a) {
  * @param {string[]} terms  английские поисковые термины (2–4 шт)
  * @returns {{ok:boolean, articles:Array, tried:Array, reason?:string}}
  */
-async function retrieve(terms, opts = {}) {
+export async function retrieve(terms, opts = {}) {
   const o = { ...DEFAULTS, ...opts };
   const queries = buildQueries(terms, o);
   if (!queries.length) return { ok: false, reason: 'no_terms', articles: [], tried: [] };
@@ -243,7 +241,7 @@ async function retrieve(terms, opts = {}) {
  * Пронумерованный контекст. Номер = позиция в массиве + 1.
  * Это единственный идентификатор, который увидит модель.
  */
-function buildContext(articles) {
+export function buildContext(articles) {
   return articles
     .map((a, i) => {
       const n = i + 1;
@@ -256,14 +254,3 @@ function buildContext(articles) {
     })
     .join('\n\n---\n\n');
 }
-
-module.exports = {
-  retrieve,
-  buildContext,
-  buildQueries,
-  evidenceLevel,
-  normalize,
-  truncateAbstract,
-  score,
-  DEFAULTS,
-};
