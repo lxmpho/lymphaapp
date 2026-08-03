@@ -269,17 +269,28 @@ export async function askLympha(question) {
 
   if (!found.ok && found.reason === 'search_failed') return { error: 'pmc_unreachable' };
   if (!found.articles.length) {
+    // Отличаем «ничего не нашлось» от «нашлось, но всё мимо темы»
+    const recommendation = found.reason === 'no_relevant'
+      ? 'Публикации по запросу нашлись, но ни одна не относится напрямую к теме вопроса — ' +
+        'релевантных статей с абстрактами в Europe PMC не найдено. ' +
+        'Попробуйте уточнить формулировку или конкретное вмешательство.'
+      : 'По этому вопросу не найдено публикаций с абстрактами в Europe PMC за последние 12 лет. ' +
+        'Попробуйте переформулировать вопрос или сузить его до конкретного вмешательства.';
     return {
       ok: true,
       sufficient: false,
       grade: 'none',
-      recommendation:
-        'По этому вопросу не найдено публикаций с абстрактами в Europe PMC за последние 12 лет. ' +
-        'Попробуйте переформулировать вопрос или сузить его до конкретного вмешательства.',
+      recommendation,
       statements: [],
       evidence: [],
       limitations: '',
-      retrieval: { terms, totalFound: 0, shown: 0, tried: found.tried },
+      retrieval: {
+        terms,
+        totalFound: 0,
+        shown: 0,
+        tried: found.tried,
+        filtering: found.filtering || null,
+      },
       trustedCount: 0,
       totalCitations: 0,
       hasProblems: false,
@@ -307,6 +318,7 @@ export async function askLympha(question) {
       totalFound: found.totalFound || found.articles.length,
       shown: found.articles.length,
       tried: found.tried,
+      filtering: found.filtering || null,
     },
     trustedCount: evidence.length,
     totalCitations: evidence.length,

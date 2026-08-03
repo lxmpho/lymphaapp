@@ -1,8 +1,15 @@
 /**
- * Лимфа — retrieval-слой (ES module).
+ * Лимфа — retrieval-слой (ES module) v2.
  *
- * Ищет реальные статьи в Europe PMC, классифицирует их по уровню
- * доказательности и собирает пронумерованный контекст для модели.
+ * Ищет реальные статьи в Europe PMC, фильтрует по релевантности теме,
+ * классифицирует по уровню доказательности и собирает пронумерованный
+ * контекст для модели.
+ *
+ * v2 добавляет слой РЕЛЕВАНТНОСТИ: v1 доверчиво брал всё, что вернул
+ * Europe PMC, и топ-8 набирался из высокоуровневых, но НЕ по теме статей
+ * (ортопедия, онкогематология под запрос про дентальные импланты).
+ * Теперь: поиск по заголовку/абстракту, скоринг текстового совпадения,
+ * негативные фильтры и порог отсечки.
  *
  * Главный принцип: PMID приходит ТОЛЬКО отсюда, из ответа Europe PMC.
  * Модель никогда не печатает PMID — она ссылается на номер [1], [2].
@@ -16,7 +23,17 @@ export const DEFAULTS = {
   maxContext: 8,        // сколько статей уйдёт в контекст модели
   abstractChars: 1400,  // обрезка абстракта
   timeoutMs: 12000,
+  minRelevance: 2,      // минимум очков совпадения, чтобы статья прошла
 };
+
+// Темы, которые регулярно ложно всплывают под стоматологические запросы.
+// Если заголовок про это — статья почти наверняка не о зубах.
+const OFFTOPIC_TITLE = [
+  'orthopaedic', 'orthopedic', 'arthroplasty', 'hip ', 'knee ', 'spinal', 'spine',
+  'cardiac', 'heart valve', 'prosthetic joint', 'total joint',
+  'leukemia', 'leukaemia', 'lymphoma', 'chemotherapy', 'haematolog', 'hematolog',
+  'cochlear', 'breast implant', 'penile', 'ocular',
+];
 
 /* ------------------------------------------------------------------ */
 /*  HTTP                                                               */
@@ -60,8 +77,11 @@ function escapeTerm(t) {
 }
 
 /**
- * Запросы строит СЕРВЕР, а не модель. Модель даёт только английские
- * термины — синтаксис Europe PMC она путает, а мы нет.
+ * Запросы строит СЕРВЕР, а не модель.
+ *
+ * v2: термины ищем в TITLE_ABS (заголовок + абстракт), а не по всему
+ * тексту. Это резко повышает релевантность: слово в заголовке/абстракте
+ * означает, что статья РЕАЛЬНО об этом, а не просто упомянула вскользь.
  */
 export function buildQueries(terms, opts = {}) {
   const o = { ...DEFAULTS, ...opts };
@@ -71,7 +91,11 @@ export function buildQueries(terms, opts = {}) {
   const toYear = new Date().getFullYear();
   const fromYear = toYear - o.yearsBack;
 
-  const core = clean.map((t) => `"${t}"`).join(' AND ');
+  // каждый термин обязан встретиться в заголовке ИЛИ абстракте
+  const core = clean
+    .map((t) => `(TITLE:"${t}" OR ABSTRACT:"${t}")`)
+    .join(' AND ');
+
   const base =
     `(${core})` +
     ` AND (HAS_ABSTRACT:Y)` +
@@ -92,9 +116,6 @@ export function buildQueries(terms, opts = {}) {
       query: `${base} AND (PUB_TYPE:"Randomized Controlled Trial")`,
     },
     {
-      // Страховка: если фильтры по типу дадут ноль (Europe PMC бывает
-      // капризен с PUB_TYPE), широкий запрос всё равно принесёт статьи,
-      // а уровень доказательности мы определим сами из pubTypeList.
       tier: 'C',
       label: 'broad',
       query: base,
@@ -135,6 +156,42 @@ export function evidenceLevel(art) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Релевантность                                                      */
+/* ------------------------------------------------------------------ */
+
+function isOfftopic(title) {
+  const t = String(title || '').toLowerCase();
+  return OFFTOPIC_TITLE.some((bad) => t.includes(bad));
+}
+
+/**
+ * Очки релевантности статьи запросу.
+ * Термин в заголовке = 3, в абстракте = 1. Так статья, которая
+ * ПРО тему (термин в заголовке), обгоняет ту, что лишь упомянула.
+ */
+export function relevanceScore(art, terms) {
+  const title = String(art.title || '').toLowerCase();
+  const abs = String(art.abstract || art.abstractText || '').toLowerCase();
+  let score = 0;
+  for (const raw of terms) {
+    const t = String(raw).toLowerCase().trim();
+    if (!t) continue;
+    // считаем и по цельной фразе, и по значимым словам фразы
+    const words = t.split(/\s+/).filter((w) => w.length > 3);
+    const probes = [t, ...words];
+    let inTitle = false;
+    let inAbs = false;
+    for (const p of probes) {
+      if (title.includes(p)) inTitle = true;
+      else if (abs.includes(p)) inAbs = true;
+    }
+    if (inTitle) score += 3;
+    else if (inAbs) score += 1;
+  }
+  return score;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Нормализация и ранжирование                                        */
 /* ------------------------------------------------------------------ */
 
@@ -172,12 +229,18 @@ function dedupeKey(a) {
   return a.pmid || a.pmcid || a.doi || a.title.toLowerCase();
 }
 
+/**
+ * Итоговый скор.
+ * v2: релевантность — ПЕРВИЧНА (×8). Мета-анализ не по теме больше не
+ * обгоняет РКИ точно по теме. Уровень доказательности — вторичен.
+ */
 export function score(a) {
   const nowYear = new Date().getFullYear();
   const age = a.year ? nowYear - a.year : 15;
-  const recency = Math.max(0, 12 - age) * 1.2;      // свежее — выше
-  const impact = Math.log10(a.citedByCount + 1) * 2; // цитируемость, мягко
-  return a.level * 10 + recency + impact;
+  const recency = Math.max(0, 12 - age) * 1.2;
+  const impact = Math.log10(a.citedByCount + 1) * 2;
+  const relevance = (a.relevance || 0) * 8; // доминирующий множитель
+  return relevance + a.level * 6 + recency + impact;
 }
 
 /* ------------------------------------------------------------------ */
@@ -200,6 +263,35 @@ export async function retrieve(terms, opts = {}) {
     )
   );
 
+  const seen = new Map();
+  let rawCount = 0;
+  let offtopicCount = 0;
+  let belowThreshold = 0;
+
+  for (const r of results) {
+    if (!r.ok) continue;
+    for (const raw of r.articles) {
+      rawCount++;
+      const a = normalize(raw, o.abstractChars);
+      if (!a.abstract || a.abstract.length < 120) continue;
+      if (!a.pmid && !a.pmcid) continue;
+
+      // фильтр релевантности
+      if (isOfftopic(a.title)) { offtopicCount++; continue; }
+      a.relevance = relevanceScore({ title: a.title, abstract: a.abstract }, terms);
+      if (a.relevance < o.minRelevance) { belowThreshold++; continue; }
+
+      const key = dedupeKey(a);
+      const prev = seen.get(key);
+      // при дубле берём вариант с большей релевантностью, при равной — с уровнем
+      if (!prev ||
+          a.relevance > prev.relevance ||
+          (a.relevance === prev.relevance && a.level > prev.level)) {
+        seen.set(key, a);
+      }
+    }
+  }
+
   const tried = results.map((r) => ({
     tier: r.tier,
     label: r.label,
@@ -208,33 +300,34 @@ export async function retrieve(terms, opts = {}) {
     reason: r.reason || null,
   }));
 
-  const seen = new Map();
-  for (const r of results) {
-    if (!r.ok) continue;
-    for (const raw of r.articles) {
-      const a = normalize(raw, o.abstractChars);
-      if (!a.abstract || a.abstract.length < 120) continue; // без абстракта нечем отвечать
-      if (!a.pmid && !a.pmcid) continue;                     // нечем сослаться
-      const key = dedupeKey(a);
-      const prev = seen.get(key);
-      // при дубле оставляем запись с более высоким уровнем доказательности
-      if (!prev || a.level > prev.level) seen.set(key, a);
-    }
-  }
-
   const ranked = [...seen.values()].sort((x, y) => score(y) - score(x));
   const anyOk = results.some((r) => r.ok);
+
+  const filtering = {
+    raw: rawCount,
+    offtopic: offtopicCount,
+    belowThreshold,
+    relevant: ranked.length,
+  };
 
   if (!ranked.length) {
     return {
       ok: anyOk,
-      reason: anyOk ? 'no_results' : 'search_failed',
+      // отличаем «поиск упал» от «нашлось, но всё мимо темы»
+      reason: !anyOk ? 'search_failed' : (rawCount > 0 ? 'no_relevant' : 'no_results'),
       articles: [],
       tried,
+      filtering,
     };
   }
 
-  return { ok: true, articles: ranked.slice(0, o.maxContext), tried, totalFound: ranked.length };
+  return {
+    ok: true,
+    articles: ranked.slice(0, o.maxContext),
+    tried,
+    filtering,
+    totalFound: ranked.length,
+  };
 }
 
 /**
