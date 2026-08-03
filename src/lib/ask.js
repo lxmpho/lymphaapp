@@ -1,194 +1,317 @@
-// Лимфа — эндпоинт клинического ответа (чат).
-//
-// ТРИ СЛОЯ ДОСТОВЕРНОСТИ:
-//   1) Claude отвечает в СТРОГОМ JSON (рекомендация, GRADE, цитаты).
-//   2) Существование: каждый PMID сверяется с Europe PMC (getArticle).
-//   3) СООТВЕТСТВИЕ: заявленные Claude автор и год сравниваются с настоящими
-//      метаданными статьи. Ловит случай «PMID реальный, но ведёт на другую
-//      статью» (напр. Claude называет Esposito 2013 про имплантацию, а PMID
-//      ведёт на статью про микрофлюидику). Без лишних вызовов Claude.
+'use strict';
 
-import { getArticle } from './europepmc.js';
+/**
+ * Лимфа — /api/ask v3 (RAG).
+ *
+ * Отличие от v2: модель больше не вспоминает статьи по памяти и не печатает
+ * PMID. Пайплайн:
+ *
+ *   1. planSearch()  — Claude Haiku переводит клинический вопрос в английские
+ *                      поисковые термины (сам синтаксис запроса строит сервер).
+ *   2. retrieve()    — Europe PMC отдаёт реальные статьи с абстрактами.
+ *   3. answer()      — Claude Sonnet отвечает ТОЛЬКО по этим абстрактам и
+ *                      ссылается на номера [1..8], не на PMID.
+ *   4. mapSources()  — сервер подставляет PMID по номеру из своего же массива.
+ *
+ * Подмена PMID структурно невозможна: модель не имеет доступа к PMID.
+ */
+
+const { retrieve, buildContext } = require('./retrieve');
 
 const API_URL = 'https://api.anthropic.com/v1/messages';
-const MODEL = 'claude-sonnet-4-6';
+const MODEL_PLAN = process.env.LYMPHA_MODEL_PLAN || 'claude-haiku-4-5';
+const MODEL_ANSWER = process.env.LYMPHA_MODEL_ANSWER || 'claude-sonnet-5';
+const MAX_SOURCES = 8; // должно совпадать с retrieve DEFAULTS.maxContext
 
-const SYSTEM_PROMPT = `Ты — Лимфа, клинический ассистент для врачей-стоматологов на основе доказательной медицины.
-Отвечай строго научным языком для практикующего специалиста, без упрощений для пациентов.
-Используй терминологию: РКИ, ОШ/ОР, ДИ, NNT, I², GRADE.
-Иерархия доказательств: систематические обзоры Cochrane и мета-анализы > РКИ > когортные > мнение.
+/* ------------------------------------------------------------------ */
+/*  Вызов Claude со structured outputs                                 */
+/* ------------------------------------------------------------------ */
 
-КРИТИЧЕСКИ ВАЖНО про цитаты: указывай PMID ТОЛЬКО если уверен, что статья реально существует
-с этим PMID И этот PMID принадлежит именно этой статье. Если не уверен — НЕ придумывай,
-оставь pmid пустым и опиши источник словами. Лучше без PMID, чем с неверным PMID.
-
-Верни ТОЛЬКО валидный JSON, без markdown, без текста до или после:
-{
-  "grade": "high" | "mod" | "low" | "verylow",
-  "recommendation": "клиническая рекомендация, 2-4 предложения",
-  "evidence": [
-    {"authors":"Фамилия И. и др.", "year":"2020", "journal":"J Clin Periodontol", "pmid":"12345678", "note":"ОШ/ОР/NNT/p"}
-  ],
-  "limitations": "клинические ограничения",
-  "lang": "ru"
-}
-Отвечай на языке вопроса. Если вопрос вне стоматологии или слишком общий — скажи об этом в recommendation, evidence оставь пустым.`;
-
-// --- Разбор JSON ответа модели ---
-export function parseModelJson(text) {
-  if (!text) return null;
-  let s = String(text).trim();
-  s = s.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
-  const m = s.match(/\{[\s\S]*\}/);
-  if (!m) return null;
-  try {
-    return JSON.parse(m[0]);
-  } catch {
-    return null;
-  }
-}
-
-// --- Извлечь фамилию первого автора из строки цитаты ---
-// "Esposito M. et al." → "esposito"; "Lund B. et al." → "lund"
-function firstSurname(authors) {
-  if (!authors) return '';
-  const first = String(authors).trim().split(/[\s,]+/)[0] || '';
-  return first.replace(/[^\p{L}]/gu, '').toLowerCase();
-}
-
-// --- Соответствует ли реальная статья заявленной цитате? ---
-// Сравниваем заявленных Claude автора и год с настоящими из Europe PMC.
-// Чистая функция — тестируется без сети.
-export function citationMatches(claim, article) {
-  const claimedSurname = firstSurname(claim.authors);
-  const realAuthors = String(article.authors || '').toLowerCase();
-
-  // Автор: фамилия первого заявленного автора должна встречаться в реальном
-  // списке авторов статьи.
-  const authorOk = claimedSurname.length >= 3 && realAuthors.includes(claimedSurname);
-
-  // Год: допускаем расхождение ±1 (epub vs print).
-  const cy = parseInt(claim.year, 10);
-  const ry = parseInt(article.pubYear, 10);
-  const yearOk = !cy || !ry || Math.abs(cy - ry) <= 1;
-
-  if (!authorOk) return { ok: false, reason: 'author_mismatch' };
-  if (!yearOk) return { ok: false, reason: 'year_mismatch' };
-  return { ok: true, reason: null };
-}
-
-// --- Проверка одной цитаты: существование + соответствие ---
-async function verifyCitation(claim) {
-  const pmid = claim.pmid;
-  const base = {
-    verified: false, matches: false, mismatchReason: 'no_pmid',
-    realTitle: null, realAuthors: null, realJournal: null, realYear: null,
-  };
-  if (!pmid || !/^(PMC)?\d+$/i.test(String(pmid))) return base;
-  try {
-    const art = await getArticle(String(pmid));
-    if (!art || !art.title) {
-      return { ...base, mismatchReason: 'not_found' };
-    }
-    const match = citationMatches(claim, art);
-    return {
-      verified: true,                 // PMID существует в Europe PMC
-      matches: match.ok,              // и метаданные совпадают с заявленной цитатой
-      mismatchReason: match.ok ? null : match.reason,
-      realTitle: art.title,
-      realAuthors: art.authors || null,
-      realJournal: art.journal || null,
-      realYear: art.pubYear || null,
-    };
-  } catch {
-    return { ...base, mismatchReason: 'error' };
-  }
-}
-
-export async function askLympha(question) {
+async function callClaude({ model, system, user, schema, maxTokens = 2000, timeoutMs = 45000 }) {
   const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) return { error: 'no_api_key', message: 'Сервис ИИ временно недоступен.' };
-  if (!question || !String(question).trim()) return { error: 'empty_question', message: 'Пустой вопрос.' };
+  if (!key) return { ok: false, error: 'no_api_key' };
 
-  let data;
+  const body = {
+    model,
+    max_tokens: maxTokens,
+    system,
+    messages: [{ role: 'user', content: user }],
+    output_config: { format: { type: 'json_schema', schema } },
+  };
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(API_URL, {
       method: 'POST',
+      signal: ctrl.signal,
       headers: {
-        'Content-Type': 'application/json',
+        'content-type': 'application/json',
         'x-api-key': key,
         'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 1500,               // без thinking ответу с цитатами этого хватает
-        thinking: { type: 'disabled' }, // ЭКОНОМИЯ: не платим за невидимые размышления
-        system: SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: String(question) }],
-      }),
+      body: JSON.stringify(body),
     });
+
+    const data = await res.json().catch(() => null);
     if (!res.ok) {
-      const body = await res.text();
-      return { error: 'ai_error', status: res.status, detail: body.slice(0, 300) };
+      const msg = (data && data.error && data.error.message) || `http_${res.status}`;
+      return { ok: false, error: 'ai_error', detail: msg };
     }
-    data = await res.json();
-  } catch (err) {
-    return { error: 'ai_unreachable', message: err.message };
+    if (data.stop_reason === 'refusal') return { ok: false, error: 'ai_refusal' };
+    if (data.stop_reason === 'max_tokens') return { ok: false, error: 'ai_truncated' };
+
+    // при adaptive thinking в content могут быть thinking-блоки — берём только text
+    const text = (data.content || [])
+      .filter((b) => b && b.type === 'text')
+      .map((b) => b.text)
+      .join('');
+
+    // structured outputs гарантируют валидный JSON, но парсим защищённо
+    try {
+      return { ok: true, data: JSON.parse(text) };
+    } catch {
+      return { ok: false, error: 'bad_format' };
+    }
+  } catch (e) {
+    return { ok: false, error: e.name === 'AbortError' ? 'ai_timeout' : 'ai_unreachable' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Шаг 1. План поиска                                                 */
+/* ------------------------------------------------------------------ */
+
+const PLAN_SCHEMA = {
+  type: 'object',
+  properties: {
+    isClinical: { type: 'boolean' },
+    terms: { type: 'array', items: { type: 'string' } },
+    fallbackTerms: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['isClinical', 'terms', 'fallbackTerms'],
+  additionalProperties: false,
+};
+
+const PLAN_SYSTEM = `You convert a dentist's clinical question (usually in Russian) into English search terms for the Europe PMC biomedical literature database.
+
+Rules:
+- isClinical: false if the question is not a clinical/biomedical question (chit-chat, admin, off-topic). Then return empty arrays.
+- terms: 2-4 precise English concepts that will be ANDed together. Use standard biomedical vocabulary (MeSH-style) — e.g. "dental implant", "antibiotic prophylaxis", "peri-implantitis", "alveolar ridge augmentation".
+- Do NOT include study-design words ("systematic review", "RCT") — the server adds those filters.
+- Do NOT include boolean operators, quotes, field codes or wildcards. Plain concepts only.
+- fallbackTerms: 1-2 broader concepts, used only if the precise search returns nothing.
+
+Example: "Нужна ли антибиотикопрофилактика при дентальной имплантации?"
+-> terms: ["dental implants", "antibiotic prophylaxis"], fallbackTerms: ["dental implants"]`;
+
+async function planSearch(question) {
+  return callClaude({
+    model: MODEL_PLAN,
+    system: PLAN_SYSTEM,
+    user: question,
+    schema: PLAN_SCHEMA,
+    maxTokens: 300,
+    timeoutMs: 15000,
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Шаг 3. Ответ строго по контексту                                   */
+/* ------------------------------------------------------------------ */
+
+// enum фиксирован 1..8 намеренно: схема не меняется между запросами,
+// значит скомпилированная грамматика берётся из кэша (быстрее).
+// Номера больше фактического числа статей сервер отбросит сам.
+const ANSWER_SCHEMA = {
+  type: 'object',
+  properties: {
+    sufficient: { type: 'boolean' },
+    grade: { type: 'string', enum: ['high', 'mod', 'low', 'verylow', 'none'] },
+    recommendation: { type: 'string' },
+    statements: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          text: { type: 'string' },
+          sources: {
+            type: 'array',
+            items: { type: 'integer', enum: [1, 2, 3, 4, 5, 6, 7, 8] },
+          },
+        },
+        required: ['text', 'sources'],
+        additionalProperties: false,
+      },
+    },
+    limitations: { type: 'string' },
+  },
+  required: ['sufficient', 'grade', 'recommendation', 'statements', 'limitations'],
+  additionalProperties: false,
+};
+
+const ANSWER_SYSTEM = `You are Lympha, an evidence-based dentistry assistant for practising dentists. You answer in RUSSIAN, in a precise scientific clinical register.
+
+You are given a numbered list of real articles retrieved from Europe PMC. These are your ONLY permitted source of factual claims.
+
+HARD RULES:
+1. Every factual claim MUST come from the provided abstracts. Never use your own memory of the literature. If the abstracts don't say it, don't say it.
+2. Cite by NUMBER only, via the "sources" field. Never write PMIDs, DOIs, journal names or author names inside "text" — the server attaches those itself.
+3. Never cite a number that is not in the provided list.
+4. If the retrieved articles do not actually answer the question, set sufficient=false, grade="none", explain briefly in "recommendation" that the evidence base found is insufficient, and leave statements empty. This is a correct, valuable answer — do not paper over gaps.
+5. Do not overstate. A single small trial is not "shown"; it is "suggested by limited data".
+
+Fields:
+- grade: overall GRADE certainty of the body of evidence you used — "high" | "mod" | "low" | "verylow" | "none".
+  Weigh study design (guidelines/meta-analyses/systematic reviews > RCT > observational), consistency across sources, and how directly they address the question.
+- recommendation: 2-4 sentences in Russian. The actionable clinical bottom line. No citations here.
+- statements: the evidence, broken into individual claims. Each has "text" (one clear sentence in Russian) and "sources" (numbers backing exactly that claim). 3-6 statements.
+- limitations: 1-3 sentences in Russian on what the found evidence does NOT settle (heterogeneity, short follow-up, narrow population, etc.). Be honest.`;
+
+async function answerFromContext(question, articles) {
+  const context = buildContext(articles);
+  const user = [
+    `КЛИНИЧЕСКИЙ ВОПРОС:\n${question}`,
+    '',
+    `НАЙДЕННЫЕ СТАТЬИ (${articles.length}) — единственный разрешённый источник:`,
+    '',
+    context,
+  ].join('\n');
+
+  return callClaude({
+    model: MODEL_ANSWER,
+    system: ANSWER_SYSTEM,
+    user,
+    schema: ANSWER_SCHEMA,
+    maxTokens: 2500,
+    timeoutMs: 60000,
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Шаг 4. Сервер подставляет PMID по номеру                           */
+/* ------------------------------------------------------------------ */
+
+function mapSources(parsed, articles) {
+  const used = new Map(); // index -> [statement texts]
+  const statements = [];
+
+  for (const st of parsed.statements || []) {
+    const text = String(st.text || '').trim();
+    if (!text) continue;
+    // отбрасываем номера вне диапазона фактически найденных статей
+    const valid = [...new Set(st.sources || [])]
+      .filter((n) => Number.isInteger(n) && n >= 1 && n <= articles.length);
+    if (!valid.length) continue; // утверждение без источника не показываем
+    statements.push({ text, sources: valid });
+    for (const n of valid) {
+      if (!used.has(n)) used.set(n, []);
+      used.get(n).push(text);
+    }
   }
 
-  const text = (data?.content || [])
-    .filter((b) => b.type === 'text')
-    .map((b) => b.text)
-    .join('\n');
+  const evidence = [...used.keys()]
+    .sort((a, b) => a - b)
+    .map((n) => {
+      const a = articles[n - 1];
+      return {
+        n,
+        title: a.title,
+        authors: a.authors,
+        year: a.year,
+        journal: a.journal,
+        design: a.design,
+        pmid: a.pmid,
+        pmcid: a.pmcid,
+        doi: a.doi,
+        url: a.pmid
+          ? `https://pubmed.ncbi.nlm.nih.gov/${a.pmid}/`
+          : `https://europepmc.org/article/PMC/${a.pmcid}`,
+        isOpenAccess: a.isOpenAccess,
+        note: used.get(n).join(' '),
+        // Совместимость с текущим фронтендом. Теперь эти флаги всегда true
+        // по построению: метаданные пришли из Europe PMC, а не от модели.
+        trusted: true,
+        verified: true,
+        matches: true,
+      };
+    });
 
-  const parsed = parseModelJson(text);
-  if (!parsed) {
+  return { statements, evidence };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Оркестрация                                                        */
+/* ------------------------------------------------------------------ */
+
+async function ask(question) {
+  const q = String(question || '').trim();
+  if (q.length < 5) return { error: 'empty_question' };
+  if (q.length > 1000) return { error: 'question_too_long' };
+
+  // 1. План поиска
+  const plan = await planSearch(q);
+  if (!plan.ok) return { error: plan.error, detail: plan.detail };
+  if (!plan.data.isClinical || !plan.data.terms.length) {
+    return { error: 'not_clinical' };
+  }
+
+  // 2. Поиск (+ один расширенный ретрай)
+  let terms = plan.data.terms;
+  let found = await retrieve(terms);
+
+  if ((!found.ok || !found.articles.length) && (plan.data.fallbackTerms || []).length) {
+    terms = plan.data.fallbackTerms;
+    found = await retrieve(terms);
+  }
+
+  if (!found.ok && found.reason === 'search_failed') return { error: 'pmc_unreachable' };
+  if (!found.articles.length) {
     return {
-      error: 'bad_format',
-      message: 'Не удалось разобрать ответ ИИ.',
-      stopReason: data?.stop_reason || null,
-      rawPreview: String(text || '').slice(0, 500),
+      ok: true,
+      sufficient: false,
+      grade: 'none',
+      recommendation:
+        'По этому вопросу не найдено публикаций с абстрактами в Europe PMC за последние 12 лет. ' +
+        'Попробуйте переформулировать вопрос или сузить его до конкретного вмешательства.',
+      statements: [],
+      evidence: [],
+      limitations: '',
+      retrieval: { terms, totalFound: 0, shown: 0, tried: found.tried },
+      trustedCount: 0,
+      totalCitations: 0,
+      hasProblems: false,
     };
   }
 
-  const rawEvidence = Array.isArray(parsed.evidence) ? parsed.evidence : [];
-  const evidence = await Promise.all(
-    rawEvidence.map(async (e) => {
-      const claim = {
-        authors: e.authors || '', year: e.year || '',
-        journal: e.journal || '', pmid: e.pmid || null,
-      };
-      const check = await verifyCitation(claim);
-      return {
-        authors: claim.authors,
-        year: claim.year,
-        journal: claim.journal,
-        pmid: claim.pmid,
-        note: e.note || '',
-        // трёхуровневый статус доверия:
-        verified: check.verified,          // PMID существует
-        matches: check.matches,            // и это та самая статья
-        mismatchReason: check.mismatchReason,
-        realTitle: check.realTitle,        // что за статья на самом деле
-        realAuthors: check.realAuthors,
-        realJournal: check.realJournal,
-        realYear: check.realYear,
-        // итоговый признак надёжности для клиента:
-        trusted: check.verified && check.matches,
-      };
-    })
-  );
+  // 3. Ответ строго по найденному
+  const res = await answerFromContext(q, found.articles);
+  if (!res.ok) return { error: res.error, detail: res.detail };
 
-  const trustedCount = evidence.filter((e) => e.trusted).length;
+  // 4. Номера -> реальные PMID
+  const { statements, evidence } = mapSources(res.data, found.articles);
+  const sufficient = res.data.sufficient !== false && statements.length > 0;
 
   return {
-    grade: ['high', 'mod', 'low', 'verylow'].includes(parsed.grade) ? parsed.grade : 'mod',
-    recommendation: parsed.recommendation || '',
+    ok: true,
+    sufficient,
+    grade: sufficient ? res.data.grade : 'none',
+    recommendation: res.data.recommendation,
+    statements,
     evidence,
-    limitations: parsed.limitations || '',
-    trustedCount,
+    limitations: res.data.limitations,
+    retrieval: {
+      terms,
+      totalFound: found.totalFound || found.articles.length,
+      shown: found.articles.length,
+      tried: found.tried,
+    },
+    trustedCount: evidence.length,
     totalCitations: evidence.length,
-    // есть ли цитаты с PMID, которым нельзя доверять (не найдены или не та статья)
-    hasProblems: evidence.some((e) => e.pmid && !e.trusted),
+    hasProblems: false, // выдуманных PMID больше не бывает by design
   };
 }
+
+module.exports = { ask, mapSources, planSearch, answerFromContext, MAX_SOURCES };
